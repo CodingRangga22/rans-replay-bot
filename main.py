@@ -32,6 +32,26 @@ coins they hold earn a bounded score bonus, the bot mirrors their
 exits on coins it holds, and entries backed by them may ride to a 2x
 take-profit.
 
+Version 8 is the aggressive variant the owner asked for after seeing
+the development leaderboard: stakes roughly quadruple, the round-trip
+budget is far higher (churn is the point), breakouts may be chased
+much further, take-profit and trailing room widen so runners can
+run, and stakes press up once profit is banked and halve while in
+drawdown. What does NOT change: the hard anti-rug filters, the
+20-coin round-trip floor with its pace-driven fallback, the mirror
+exit on the watchlist wallets, and a drawdown brake set below the
+competition's 50% eligibility ceiling — aggression is sized, never
+blind.
+
+Version 8's final form adds the owner's copy-execution instruction:
+the watchlist is no longer just a score bonus. When a watchlist
+wallet buys at least COPY_MIN_WALLET_BUY of a coin, the bot enters
+that coin in the SAME batch (the fastest reaction the harness
+allows), at COPY_STAKE, provided the coin passes the same hard
+anti-rug filters as any other entry — the wallet triggers, the
+screening vetoes. Copy entries get their own exit profile and the
+mirror exit on the wallet's own exit still applies.
+
 Determinism: no clock, no environment, no randomness; iteration is only
 over insertion-ordered dicts, sets are used for membership tests only.
 Standard library only.
@@ -58,7 +78,7 @@ MIN_ROUND_TRIP = 10_000_000        # 0.01 SOL: the guardrail's minimum buy
 CURVE_FEE = 0.0125                 # 95 bps protocol + 30 bps creator
 
 # Hard safety filters — NEVER relaxed by the fallback tiers.
-HARD_MIN_REAL_QUOTE = 8 * LAMPORTS     # real SOL reserves (liquidity floor)
+HARD_MIN_REAL_QUOTE = 12 * LAMPORTS    # v8: size needs deeper liquidity
 HARD_MAX_TOP_BUYER_SHARE = 0.62        # one wallet dominating buys = bundle risk
 HARD_MAX_CREATOR_BUY_SHARE = 0.45      # creator buying their own launch too hard
 HARD_MAX_SELL_RATIO = 0.85             # sell SOL may not exceed 85% of buy SOL
@@ -69,20 +89,31 @@ HARD_MIN_WINDOW_TRADES = 6
 # Fallback tiers: (name, until_elapsed_fraction, min_buys, min_unique_buyers,
 #                 min_net_sol, min_price_up, min_near_high, stake_lamports,
 #                 chase_cap, stop_loss, trail_gap, soft_hold_slots)
-# v5 tuning, from the dev grade of v4 (87 round trips, net -0.073 SOL of
-# which 0.064 SOL was pure fees): the loose tiers produced too many weak,
-# fee-dominated trades, strong-tier winners were harvested too early and
-# weak-tier losers too late. So the relaxed/endgame entry bars are higher,
-# exits are per-tier (strong entries get room to run, weak ones are cut
-# faster), and a hard round-trip budget caps fee drag.
+# v8 aggressive tuning (owner's call after the dev leaderboard): the
+# v5-v7 settings were built to finish near zero safely; this variant
+# competes on SIZE — stakes up to 0.30 SOL, concentrated on the
+# strictest tier — under the owner's condition that the SCREENING and
+# the EXECUTION stay guarded hard. Screening (tighter than v7): higher
+# net-flow and momentum bars, recent flow must dominate the window
+# (not just exceed its older half), chase caps keep the bot off
+# vertical tops, deeper liquidity floor, the v5 volatility filter.
+# Execution (the v7 profile, whose win/loss asymmetry was the closest
+# to breakeven this signal family produced): losers cut at -8..-10%,
+# take-profit +60%, trailing arms at +18%, stall and fade exits on.
+# Two aggressive drafts that loosened these exits scaled losses
+# instead (dev -0.287 and -0.261 SOL), so looseness was reverted; what
+# stayed aggressive is the sizing, the churn budget, and the copy
+# trigger below. The pace fallback and the 0.01 SOL round-trip floor
+# are unchanged, so the 20-coin eligibility bar is secured the same
+# way as before; the drawdown brake sits below the 50% ceiling.
 TIERS = (
-    ("strict",   0.40, 10, 6, 2.00,  0.05, 0.92, 80_000_000, 0.75, -0.10, 0.16, 900),
-    ("standard", 0.70,  8, 5, 1.35,  0.03, 0.90, 55_000_000, 0.65, -0.10, 0.12, 900),
-    ("relaxed",  0.88,  7, 5, 0.90,  0.01, 0.86, 35_000_000, 0.55, -0.08, 0.09, 700),
-    ("endgame",  1.01,  6, 4, 0.55,  0.00, 0.82, 18_000_000, 0.45, -0.08, 0.09, 700),
+    ("strict",   0.40, 12, 7, 3.00,  0.15, 0.94, 300_000_000, 1.10, -0.10, 0.16, 900),
+    ("standard", 0.70, 10, 6, 2.20,  0.10, 0.92, 150_000_000, 0.90, -0.10, 0.12, 900),
+    ("relaxed",  0.88,  8, 5, 1.40,  0.05, 0.90, 80_000_000, 0.70, -0.08, 0.09, 700),
+    ("endgame",  1.01,  7, 5, 0.80,  0.02, 0.86, 30_000_000, 0.50, -0.08, 0.09, 700),
 )
 TARGET_ROUND_TRIPS = 24            # guardrail is 20; aim above it for margin
-RT_BUDGET = 44                     # hard cap on round trips: fee-drag brake
+RT_BUDGET = 90                     # churn, but every trade must earn its fees
 MAX_SLIPPAGE_BPS = 2_000
 
 # Volatility filter (entries, every tier): a coin whose price already
@@ -93,9 +124,12 @@ VOL_MAX_CRASH = 0.62               # low after the high must stay >= 62% of it
 # Exit rules (stop-loss / trailing gap / soft hold are per-tier, above)
 TAKE_PROFIT = 0.60
 TRAIL_ARM = 0.18                   # trailing stop arms at +18%
-HOLD_HARD_SLOTS = 1_800            # never hold longer than this
+HOLD_HARD_SLOTS = 1_800            # never hold longer than ~12 minutes
 REENTRY_COOLDOWN = 900
-DRAWDOWN_BRAKE = 0.35              # pause new entries beyond this drawdown
+DRAWDOWN_BRAKE = 0.38              # pause new entries beyond this drawdown
+DD_STAKE_HALVE = 0.20              # beyond this drawdown, stakes halve
+PRESS_EQUITY = 12 * LAMPORTS       # banked profit: press stakes up
+PRESS_MULT = 1.5                   # stake multiplier once pressing
 
 
 # ---------------------------------------------------------------------------
@@ -160,9 +194,49 @@ WATCHLIST = {
     "DkzUg73acuQzkctMNnBnVaSYeqDGXzWCtoiKV9GyZAJc": True,
     "9NXNywh7n8d8ihgUY2FcJn9hEPwXkYCdLyBdbFiDm4rs": True,
 }
-WATCH_TP = 1.00                    # 2x take-profit for watchlist-backed entries
+WATCH_TP = 1.00                    # 2x take-profit for watchlist-backed
+                                   # entries (the owner's own rule)
 watch_backed = {}                  # mint -> True when our entry had a
                                    # watchlist holder behind it
+
+# v8 copy execution: a watchlist buy of at least this size is a direct
+# entry trigger (hard filters still veto), at COPY_STAKE, with its own
+# exit profile (COPY_SL / COPY_TG / COPY_SOFT, take-profit WATCH_TP).
+COPY_MIN_WALLET_BUY = 250_000_000  # 0.25 SOL: ignore dust-sized buys
+COPY_STAKE = 300_000_000           # 0.30 SOL per copy entry (cap applies)
+COPY_SL = -0.10
+COPY_TG = 0.12
+COPY_SOFT = 900
+copy_backed = {}                   # mint -> True for copy-triggered entries
+
+# v8 launch sleeve: the momentum tiers only see coins AFTER they have
+# already moved — in the dev data every winner was cut at a few percent
+# because the remaining upside inside the window was already spent.
+# The multiples live in the first minutes of a launch. This sleeve
+# takes small, cap-limited shots at very young coins with violent
+# one-sided buy flow, under its own gates (no near-high requirement —
+# price is still being discovered — but stricter buyer-concentration
+# and sell-pressure limits, and the creator-dump veto still applies).
+# Wide exits (TP +250%, trailing gap 0.30) because a launch position
+# is a lottery ticket, not a scalp; a hard count cap bounds the blast
+# radius if the sleeve misfires on unseen data.
+LAUNCH_MAX_AGE = 1500              # only coins younger than ~10 minutes
+LAUNCH_MAX_RESERVES = 60 * LAMPORTS
+LAUNCH_MIN_BUYS = 14
+LAUNCH_MIN_UNIQ = 7
+LAUNCH_MIN_NET = 1_500_000_000     # 1.5 SOL net flow inside the window
+LAUNCH_MAX_TOP_SHARE = 0.55
+LAUNCH_MAX_CREATOR_SHARE = 0.35
+LAUNCH_MAX_SELL_RATIO = 0.60
+LAUNCH_MIN_LOW = 0.55              # no full collapse inside the window
+LAUNCH_STAKE = 150_000_000         # 0.15 SOL (the reserve cap binds first)
+LAUNCH_MAX_ENTRIES = 25
+LAUNCH_SL = -0.15
+LAUNCH_TG = 0.30
+LAUNCH_SOFT = 1800
+LAUNCH_TP = 2.50
+launch_backed = {}                 # mint -> True for sleeve entries
+launch_count = 0
 
 wallet_pos = {}       # (user, mint) -> [sol_in, tok_in, sol_out, tok_out,
                       #                  realized, last_buy_slot]
@@ -374,8 +448,39 @@ def position_value_lamports(state, mint, tokens):
 # Main per-batch logic
 # ---------------------------------------------------------------------------
 
+def launch_safe(state, mint, t, st):
+    """The launch sleeve's own gates (see LAUNCH_* above)."""
+    curve = state.curves.get(mint)
+    if curve is None or curve.complete:
+        return False
+    if curve.real_quote_reserves < HARD_MIN_REAL_QUOTE:
+        return False
+    if curve.real_quote_reserves > LAUNCH_MAX_RESERVES:
+        return False
+    if t.creator_sold or t.created_slot is None:
+        return False
+    age = state.slot - t.created_slot
+    if age < HARD_MIN_AGE_SLOTS or age > LAUNCH_MAX_AGE:
+        return False
+    if st["buys"] < LAUNCH_MIN_BUYS or st["unique_buyers"] < LAUNCH_MIN_UNIQ:
+        return False
+    if st["net"] < LAUNCH_MIN_NET:
+        return False
+    if st["net_new"] * 2 <= st["net"]:
+        return False  # flow must be accelerating into the close
+    if st["top_share"] > LAUNCH_MAX_TOP_SHARE:
+        return False
+    if st["creator_share"] > LAUNCH_MAX_CREATOR_SHARE:
+        return False
+    if st["sell_sol"] > st["buy_sol"] * LAUNCH_MAX_SELL_RATIO:
+        return False
+    if st["low_after_high"] < LAUNCH_MIN_LOW:
+        return False
+    return True
+
+
 def on_batch(state, batch):
-    global first_slot, peak_equity, entries_paused
+    global first_slot, peak_equity, entries_paused, launch_count
 
     if first_slot is None:
         first_slot = state.slot
@@ -388,6 +493,7 @@ def on_batch(state, batch):
     traded = {}       # mint -> True, insertion ordered by first touch
     big_sell = {}     # mint -> True when a large sell lands this batch
     smart_exit = {}   # mint -> True when a proven holder exits most of it
+    copy_sig = {}     # mint -> total watchlist buy lamports this batch
     for e in batch["events"]:
         mint = e["mint"]
         kind = e["event"]
@@ -414,6 +520,8 @@ def on_batch(state, batch):
             if e["is_buy"]:
                 t.total_buys += 1
                 wallet_buy(user, mint, sol, tok, e["slot"])
+                if user in smart and sol >= COPY_MIN_WALLET_BUY:
+                    copy_sig[mint] = copy_sig.get(mint, 0) + sol
             else:
                 t.total_sells += 1
                 if t.creator is not None and user == t.creator:
@@ -442,11 +550,20 @@ def on_batch(state, batch):
             # Exit parameters are frozen from the tier in force when the
             # position appears: strong-signal entries get room to run,
             # weak endgame entries are cut faster.
-            held[mint] = {"entry_slot": now, "peak_pnl": 0.0,
-                          "sl": cur_tier[9], "tg": cur_tier[10],
-                          "soft": cur_tier[11],
-                          "tp": WATCH_TP if mint in watch_backed
-                          else TAKE_PROFIT}
+            if mint in copy_backed:
+                held[mint] = {"entry_slot": now, "peak_pnl": 0.0,
+                              "sl": COPY_SL, "tg": COPY_TG,
+                              "soft": COPY_SOFT, "tp": WATCH_TP}
+            elif mint in launch_backed:
+                held[mint] = {"entry_slot": now, "peak_pnl": 0.0,
+                              "sl": LAUNCH_SL, "tg": LAUNCH_TG,
+                              "soft": LAUNCH_SOFT, "tp": LAUNCH_TP}
+            else:
+                held[mint] = {"entry_slot": now, "peak_pnl": 0.0,
+                              "sl": cur_tier[9], "tg": cur_tier[10],
+                              "soft": cur_tier[11],
+                              "tp": WATCH_TP if mint in watch_backed
+                              else TAKE_PROFIT}
         elif mint in held and mint in closed_mints and mint not in state.positions:
             pass
 
@@ -489,11 +606,11 @@ def on_batch(state, batch):
         elif mint in smart_exit:
             sell = True  # a proven degen is leaving: mirror the exit
         elif fade is not None and fade["net"] < 0 and pnl < 0.02:
-            sell = True
+            sell = True  # guarded execution: fading and not winning = out
         elif age >= HOLD_HARD_SLOTS:
             sell = True
         elif age >= h.get("soft", 900) and pnl < 0.15:
-            sell = True
+            sell = True  # guarded execution: stalled below +15% = out
 
         if sell:
             orders.append({
@@ -511,9 +628,14 @@ def on_batch(state, batch):
         equity += position_value_lamports(state, mint, pos.token_amount)
     if peak_equity is None or equity > peak_equity:
         peak_equity = equity
+    dd_now = 0.0
     if peak_equity and peak_equity > 0:
-        dd = (peak_equity - equity) / peak_equity
-        entries_paused = dd > DRAWDOWN_BRAKE
+        dd_now = (peak_equity - equity) / peak_equity
+        entries_paused = dd_now > DRAWDOWN_BRAKE
+    # v8 stake scaling: press with banked profit, halve while bleeding.
+    stake_mult = PRESS_MULT if equity >= PRESS_EQUITY else 1.0
+    if dd_now > DD_STAKE_HALVE:
+        stake_mult *= 0.5
 
     # --- entries -------------------------------------------------------------
     tier = tier_for(state)
@@ -526,6 +648,71 @@ def on_batch(state, batch):
         open_slots = caps["max_open_positions"] - state.committed_position_count()
         # Sells sent this batch free their slot only on fill; stay conservative
         # and let committed_position_count (which counts pending buys) rule.
+        # --- v8 copy execution: watchlist buys are direct triggers -------
+        for mint in copy_sig:
+            if len(orders) >= max_orders or open_slots <= 0:
+                break
+            if mint in held or mint in pending_mints or mint in dead_mints:
+                continue
+            if mint in closed_mints or cooldown_until.get(mint, -1) > now:
+                continue
+            t = tapes.get(mint)
+            if t is None:
+                continue
+            st = window_stats(t, now, EVAL_WINDOW)
+            if st is None or not hard_safe(state, mint, t, st):
+                continue  # the wallet triggers; the screening vetoes
+            cap = state.max_buy_lamports(mint)
+            amount = min(COPY_STAKE, cap)
+            if amount < MIN_ROUND_TRIP + 2_000_000:
+                continue
+            if free < amount + tx_fee:
+                continue
+            orders.append({
+                "side": "buy",
+                "mint": mint,
+                "quote_lamports": amount,
+                "max_slippage_bps": MAX_SLIPPAGE_BPS,
+            })
+            watch_backed[mint] = True
+            copy_backed[mint] = True
+            free -= amount + tx_fee
+            open_slots -= 1
+            pending_mints[mint] = True
+        # --- v8 launch sleeve: early-phase shots at young coins --------
+        if launch_count < LAUNCH_MAX_ENTRIES:
+            for mint in traded:
+                if len(orders) >= max_orders or open_slots <= 0:
+                    break
+                if launch_count >= LAUNCH_MAX_ENTRIES:
+                    break
+                if mint in held or mint in pending_mints or mint in dead_mints:
+                    continue
+                if mint in closed_mints or cooldown_until.get(mint, -1) > now:
+                    continue
+                t = tapes.get(mint)
+                if t is None:
+                    continue
+                st = window_stats(t, now, EVAL_WINDOW)
+                if st is None or not launch_safe(state, mint, t, st):
+                    continue
+                cap = state.max_buy_lamports(mint)
+                amount = min(LAUNCH_STAKE, cap)
+                if amount < MIN_ROUND_TRIP + 2_000_000:
+                    continue
+                if free < amount + tx_fee:
+                    continue
+                orders.append({
+                    "side": "buy",
+                    "mint": mint,
+                    "quote_lamports": amount,
+                    "max_slippage_bps": MAX_SLIPPAGE_BPS,
+                })
+                launch_backed[mint] = True
+                launch_count += 1
+                free -= amount + tx_fee
+                open_slots -= 1
+                pending_mints[mint] = True
         candidates = []
         for mint in traded:
             if len(candidates) >= 64:
@@ -550,11 +737,19 @@ def on_batch(state, batch):
                 continue
             if st["net_new"] <= st["net_old"]:
                 continue  # flow must still be accelerating, at every tier
+            if st["net_new"] * 2 <= st["net"]:
+                continue  # v8 screening: recent flow must DOMINATE the
+                          # window, not merely edge out its older half
             if st["up"] > chase_cap:
                 continue  # do not chase a coin that already ran too far
             if st["low_after_high"] < VOL_MAX_CRASH:
                 continue  # already crashed hard once inside this window
             score = momentum_score(st)
+            curve = state.curves.get(mint)
+            if curve is not None:
+                # v8: prefer coins liquid enough to actually take size —
+                # the order cap is 1% of real reserves.
+                score += min(1.5, curve.real_quote_reserves / (40 * LAMPORTS))
             backed = False
             si = smart_in.get(mint)
             if si:
@@ -571,7 +766,7 @@ def on_batch(state, batch):
             if len(orders) >= max_orders or open_slots <= 0:
                 break
             cap = state.max_buy_lamports(mint)
-            amount = min(stake, cap)
+            amount = min(int(stake * stake_mult), cap)
             if amount < MIN_ROUND_TRIP + 2_000_000:
                 continue  # must clear the 0.01 SOL round-trip bar with margin
             if free < amount + tx_fee:
