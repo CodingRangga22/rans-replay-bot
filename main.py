@@ -21,7 +21,15 @@ Exits are active: stop-loss, take-profit, trailing stop, momentum-fade
 exit, dump exit and a time stop rotate capital through at least 20
 distinct coins (the competition's minimum round-trip bar) with round
 trips of at least 0.01 SOL each, and a drawdown brake protects the
-50% maximum-drawdown guardrail.
+50% maximum-drawdown guardrail. Version 5 adds a volatility filter
+(a coin that already crashed hard inside its window is unstable), a
+hard round-trip budget that caps fee drag, higher entry bars on the
+loose tiers, and per-tier exits: strong-signal entries get a wider
+trailing stop so winners can run, weak endgame entries are cut faster.
+Version 6 adds smart-degen wallet tracking: a ledger of every wallet's
+round trips in the window identifies wallets with proven profitable
+exits; coins they currently hold earn a bounded score bonus, and the
+bot mirrors their exits on coins it holds.
 
 Determinism: no clock, no environment, no randomness; iteration is only
 over insertion-ordered dicts, sets are used for membership tests only.
@@ -58,22 +66,32 @@ HARD_CRASH_FLOOR = 0.50                # last price must be >= 50% of window hig
 HARD_MIN_WINDOW_TRADES = 6
 
 # Fallback tiers: (name, until_elapsed_fraction, min_buys, min_unique_buyers,
-#                 min_net_sol, min_price_up, min_near_high, stake_lamports)
+#                 min_net_sol, min_price_up, min_near_high, stake_lamports,
+#                 chase_cap, stop_loss, trail_gap, soft_hold_slots)
+# v5 tuning, from the dev grade of v4 (87 round trips, net -0.073 SOL of
+# which 0.064 SOL was pure fees): the loose tiers produced too many weak,
+# fee-dominated trades, strong-tier winners were harvested too early and
+# weak-tier losers too late. So the relaxed/endgame entry bars are higher,
+# exits are per-tier (strong entries get room to run, weak ones are cut
+# faster), and a hard round-trip budget caps fee drag.
 TIERS = (
-    ("strict",   0.40, 10, 6, 2.00,  0.05, 0.92, 80_000_000),
-    ("standard", 0.70,  8, 5, 1.20,  0.03, 0.90, 55_000_000),
-    ("relaxed",  0.88,  6, 4, 0.60,  0.01, 0.86, 35_000_000),
-    ("endgame",  1.01,  5, 3, 0.25, -0.02, 0.82, 18_000_000),
+    ("strict",   0.40, 10, 6, 2.00,  0.05, 0.92, 80_000_000, 0.75, -0.10, 0.16, 900),
+    ("standard", 0.70,  8, 5, 1.35,  0.03, 0.90, 55_000_000, 0.65, -0.10, 0.12, 900),
+    ("relaxed",  0.88,  7, 5, 0.90,  0.01, 0.86, 35_000_000, 0.55, -0.08, 0.09, 700),
+    ("endgame",  1.01,  6, 4, 0.55,  0.00, 0.82, 18_000_000, 0.45, -0.08, 0.09, 700),
 )
 TARGET_ROUND_TRIPS = 24            # guardrail is 20; aim above it for margin
+RT_BUDGET = 44                     # hard cap on round trips: fee-drag brake
 MAX_SLIPPAGE_BPS = 2_000
 
-# Exit rules
-STOP_LOSS = -0.10
+# Volatility filter (entries, every tier): a coin whose price already
+# crashed more than 38% from its window high at some point inside the
+# window is unstable — its falls gap straight through stop-losses.
+VOL_MAX_CRASH = 0.62               # low after the high must stay >= 62% of it
+
+# Exit rules (stop-loss / trailing gap / soft hold are per-tier, above)
 TAKE_PROFIT = 0.60
-TRAIL_ARM = 0.18                   # trailing stop arms at +20%
-TRAIL_GAP = 0.12                   # ...and fires 12 points below the peak
-HOLD_SOFT_SLOTS = 900            # time stop when not clearly winning
+TRAIL_ARM = 0.18                   # trailing stop arms at +18%
 HOLD_HARD_SLOTS = 1_800            # never hold longer than this
 REENTRY_COOLDOWN = 900
 DRAWDOWN_BRAKE = 0.35              # pause new entries beyond this drawdown
@@ -106,6 +124,91 @@ dead_mints = set()    # stop-lossed or creator-dumped: membership only
 first_slot = None
 peak_equity = None
 entries_paused = False
+
+# ---------------------------------------------------------------------------
+# Smart-degen wallet tracking (v6)
+#
+# Every TradeEvent names its wallet, so the bot keeps a ledger of every
+# wallet's round trips inside the window: SOL in, tokens in, SOL out,
+# tokens out, with realized PnL on each sell priced at average cost.
+# A wallet earns the "smart degen" label only from closed, proven
+# trades: at least SMART_MIN_CLOSES fully exited positions, at least
+# SMART_MIN_PROFIT_SOL total realized profit, and at least 60% of its
+# closes profitable — wallets that buy low, sell high, and know their
+# exits. Two uses, both conservative: a coin a proven wallet is
+# currently holding gets a bounded score bonus (hard filters and tier
+# bars are unchanged), and if a proven holder of a coin WE hold exits
+# most of its position, we mirror the exit.
+# ---------------------------------------------------------------------------
+
+SMART_MIN_CLOSES = 2
+SMART_MIN_PROFIT = 1 * LAMPORTS    # total realized profit across closes
+SMART_BONUS = 1.0                  # score bonus per proven holder
+SMART_BONUS_CAP = 2.0
+SMART_EXIT_FRACTION = 0.60         # proven holder sells >= 60%: mirror it
+
+wallet_pos = {}       # (user, mint) -> [sol_in, tok_in, sol_out, tok_out,
+                      #                  realized, last_buy_slot]
+wallet_book = {}      # user -> [realized_total, closes, wins]
+user_mints = {}       # user -> {mint: True} open positions, insertion ordered
+smart = set()         # users that earned the label (membership only)
+smart_in = {}         # mint -> {user: last_buy_slot} proven holders in now
+
+
+def wallet_sell(user, mint, sol, tok, slot):
+    """Fold one sell into the wallet ledger; returns the fraction of the
+    seller's token position this sell represents (0 when unknown)."""
+    key = (user, mint)
+    wp = wallet_pos.get(key)
+    if wp is None:
+        return 0.0
+    frac = (tok / wp[1]) if wp[1] > 0 else 0.0
+    if wp[1] > 0 and tok > 0:
+        basis = wp[0] * min(tok, wp[1]) // wp[1]
+        wp[4] += sol - basis
+    wp[2] += sol
+    wp[3] += tok
+    if wp[1] > 0 and wp[3] >= wp[1]:
+        # Position fully closed: score the wallet on the outcome.
+        book = wallet_book.get(user)
+        if book is None:
+            book = [0, 0, 0]
+            wallet_book[user] = book
+        book[0] += wp[4]
+        book[1] += 1
+        if wp[4] > 0:
+            book[2] += 1
+        del wallet_pos[key]
+        um = user_mints.get(user)
+        if um is not None:
+            um.pop(mint, None)
+        si = smart_in.get(mint)
+        if si is not None:
+            si.pop(user, None)
+        if (user not in smart and book[1] >= SMART_MIN_CLOSES
+                and book[0] >= SMART_MIN_PROFIT
+                and book[2] * 5 >= book[1] * 3):
+            smart.add(user)
+            # Retro-mark this wallet's still-open positions.
+            for m2 in list(user_mints.get(user, {}).keys()):
+                wp2 = wallet_pos.get((user, m2))
+                if wp2 is not None:
+                    smart_in.setdefault(m2, {})[user] = wp2[5]
+    return frac
+
+
+def wallet_buy(user, mint, sol, tok, slot):
+    key = (user, mint)
+    wp = wallet_pos.get(key)
+    if wp is None:
+        wp = [0, 0, 0, 0, 0, slot]
+        wallet_pos[key] = wp
+        user_mints.setdefault(user, {})[mint] = True
+    wp[0] += sol
+    wp[1] += tok
+    wp[5] = slot
+    if user in smart:
+        smart_in.setdefault(mint, {})[user] = slot
 
 
 def tape_of(mint):
@@ -150,6 +253,7 @@ def window_stats(t, now, window):
     start_price = -1.0
     last_price = 0.0
     high = 0.0
+    low_after_high = 0.0
     by_user = {}
     creator_buy = 0
     seen = 0
@@ -162,6 +266,9 @@ def window_stats(t, now, window):
         last_price = price
         if price > high:
             high = price
+            low_after_high = price
+        elif low_after_high > 0.0 and price < low_after_high:
+            low_after_high = price
         signed = sol if is_buy else -sol
         if slot <= mid:
             net_old += signed
@@ -196,6 +303,7 @@ def window_stats(t, now, window):
         "creator_share": (creator_buy / buy_sol) if buy_sol else 0.0,
         "up": (last_price / start_price - 1.0) if start_price else 0.0,
         "near_high": (last_price / high) if high else 0.0,
+        "low_after_high": (low_after_high / high) if high else 1.0,
     }
 
 
@@ -268,6 +376,7 @@ def on_batch(state, batch):
     # --- fold this batch's events into the tapes ---------------------------
     traded = {}       # mint -> True, insertion ordered by first touch
     big_sell = {}     # mint -> True when a large sell lands this batch
+    smart_exit = {}   # mint -> True when a proven holder exits most of it
     for e in batch["events"]:
         mint = e["mint"]
         kind = e["event"]
@@ -286,17 +395,26 @@ def on_batch(state, batch):
             vq = int(e["virtual_quote_reserves"])
             price = (vq / vt) if vt else 0.0
             sol = int(e["sol_amount"])
-            t.trades.append((e["slot"], bool(e["is_buy"]), sol, e["user"], price))
+            tok = int(e["token_amount"])
+            user = e["user"]
+            t.trades.append((e["slot"], bool(e["is_buy"]), sol, user, price))
             if len(t.trades) > TAPE_MAX:
                 del t.trades[: len(t.trades) - TAPE_MAX]
             if e["is_buy"]:
                 t.total_buys += 1
+                wallet_buy(user, mint, sol, tok, e["slot"])
             else:
                 t.total_sells += 1
-                if t.creator is not None and e["user"] == t.creator:
+                if t.creator is not None and user == t.creator:
                     t.creator_sold = True
                 if sol >= LAMPORTS // 2:
                     big_sell[mint] = True
+                frac = wallet_sell(user, mint, sol, tok, e["slot"])
+                if user in smart and frac >= SMART_EXIT_FRACTION:
+                    smart_exit[mint] = True
+                    si = smart_in.get(mint)
+                    if si is not None:
+                        si.pop(user, None)
             traded[mint] = True
         else:  # CompleteEvent
             traded[mint] = True
@@ -307,9 +425,15 @@ def on_batch(state, batch):
             # Position gone: sold by us, completed, or flattened.
             closed_mints[mint] = now
             del held[mint]
+    cur_tier = tier_for(state)
     for mint in state.positions:
         if mint not in held and mint not in closed_mints:
-            held[mint] = {"entry_slot": now, "peak_pnl": 0.0}
+            # Exit parameters are frozen from the tier in force when the
+            # position appears: strong-signal entries get room to run,
+            # weak endgame entries are cut faster.
+            held[mint] = {"entry_slot": now, "peak_pnl": 0.0,
+                          "sl": cur_tier[9], "tg": cur_tier[10],
+                          "soft": cur_tier[11]}
         elif mint in held and mint in closed_mints and mint not in state.positions:
             pass
 
@@ -339,21 +463,23 @@ def on_batch(state, batch):
         fade = window_stats(t, now, FADE_WINDOW) if t is not None else None
 
         sell = False
-        if pnl <= STOP_LOSS:
+        if pnl <= h.get("sl", -0.10):
             sell = True
             dead_mints.add(mint)
         elif pnl >= TAKE_PROFIT:
             sell = True
-        elif h["peak_pnl"] >= TRAIL_ARM and pnl <= h["peak_pnl"] - TRAIL_GAP:
+        elif h["peak_pnl"] >= TRAIL_ARM and pnl <= h["peak_pnl"] - h.get("tg", 0.12):
             sell = True
         elif mint in big_sell or (t is not None and t.creator_sold):
             sell = True
             dead_mints.add(mint)
+        elif mint in smart_exit:
+            sell = True  # a proven degen is leaving: mirror the exit
         elif fade is not None and fade["net"] < 0 and pnl < 0.02:
             sell = True
         elif age >= HOLD_HARD_SLOTS:
             sell = True
-        elif age >= HOLD_SOFT_SLOTS and pnl < 0.15:
+        elif age >= h.get("soft", 900) and pnl < 0.15:
             sell = True
 
         if sell:
@@ -378,10 +504,11 @@ def on_batch(state, batch):
 
     # --- entries -------------------------------------------------------------
     tier = tier_for(state)
-    (_, _, min_buys, min_uniq, min_net_sol, min_up, min_near, stake) = tier
+    (_, _, min_buys, min_uniq, min_net_sol, min_up, min_near, stake,
+     chase_cap, _sl, _tg, _soft) = tier
     min_net = int(min_net_sol * LAMPORTS)
 
-    if not entries_paused:
+    if not entries_paused and len(closed_mints) + len(held) < RT_BUDGET:
         free = state.free_cash_lamports()
         open_slots = caps["max_open_positions"] - state.committed_position_count()
         # Sells sent this batch free their slot only on fill; stay conservative
@@ -410,9 +537,19 @@ def on_batch(state, batch):
                 continue
             if st["net_new"] <= st["net_old"]:
                 continue  # flow must still be accelerating, at every tier
-            if st["up"] > 0.75:
+            if st["up"] > chase_cap:
                 continue  # do not chase a coin that already ran too far
-            candidates.append((momentum_score(st), mint))
+            if st["low_after_high"] < VOL_MAX_CRASH:
+                continue  # already crashed hard once inside this window
+            score = momentum_score(st)
+            si = smart_in.get(mint)
+            if si:
+                recent = 0
+                for u, buy_slot in si.items():
+                    if buy_slot >= now - EVAL_WINDOW and u in smart:
+                        recent += 1
+                score += min(SMART_BONUS_CAP, recent * SMART_BONUS)
+            candidates.append((score, mint))
         # Highest score first; ties keep first-touch order (stable sort).
         candidates.sort(key=lambda c: -c[0])
         for _, mint in candidates:
@@ -433,6 +570,20 @@ def on_batch(state, batch):
             free -= amount + tx_fee
             open_slots -= 1
             pending_mints[mint] = True
+
+    # --- prune wallet ledger entries for coins gone cold ---------------------
+    if len(wallet_pos) > 200_000:
+        for (u, m) in list(wallet_pos.keys()):
+            if len(wallet_pos) <= 150_000:
+                break
+            if u in smart or m in held:
+                continue
+            wp = wallet_pos[(u, m)]
+            if now - wp[5] > 20_000:
+                del wallet_pos[(u, m)]
+                um = user_mints.get(u)
+                if um is not None:
+                    um.pop(m, None)
 
     # --- prune tapes of coins that are done and cold -------------------------
     if len(tapes) > 4000:
