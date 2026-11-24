@@ -26,10 +26,11 @@ trips of at least 0.01 SOL each, and a drawdown brake protects the
 hard round-trip budget that caps fee drag, higher entry bars on the
 loose tiers, and per-tier exits: strong-signal entries get a wider
 trailing stop so winners can run, weak endgame entries are cut faster.
-Version 6 adds smart-degen wallet tracking: a ledger of every wallet's
-round trips in the window identifies wallets with proven profitable
-exits; coins they currently hold earn a bounded score bonus, and the
-bot mirrors their exits on coins it holds.
+Version 6 added smart-degen wallet tracking; version 7 focuses that
+tracking on the owner's two chosen wallets: both are pre-trusted,
+coins they hold earn a bounded score bonus, the bot mirrors their
+exits on coins it holds, and entries backed by them may ride to a 2x
+take-profit.
 
 Determinism: no clock, no environment, no randomness; iteration is only
 over insertion-ordered dicts, sets are used for membership tests only.
@@ -129,16 +130,17 @@ entries_paused = False
 # Smart-degen wallet tracking (v6)
 #
 # Every TradeEvent names its wallet, so the bot keeps a ledger of every
-# wallet's round trips inside the window: SOL in, tokens in, SOL out,
+# wallet's positions inside the window: SOL in, tokens in, SOL out,
 # tokens out, with realized PnL on each sell priced at average cost.
-# A wallet earns the "smart degen" label only from closed, proven
-# trades: at least SMART_MIN_CLOSES fully exited positions, at least
-# SMART_MIN_PROFIT_SOL total realized profit, and at least 60% of its
-# closes profitable — wallets that buy low, sell high, and know their
-# exits. Two uses, both conservative: a coin a proven wallet is
-# currently holding gets a bounded score bonus (hard filters and tier
-# bars are unchanged), and if a proven holder of a coin WE hold exits
-# most of its position, we mirror the exit.
+# The ledger exists to follow the owner's WATCHLIST (v7, below): two
+# specific smart-degen wallets are pre-trusted, and the bot tracks
+# exactly where they stand in every coin. Two uses, both conservative:
+# a coin a watchlist wallet is currently holding gets a bounded score
+# bonus (hard filters and tier bars are unchanged), and if a watchlist
+# holder of a coin WE hold exits most of its position, we mirror the
+# exit. (An earlier version let any wallet earn the label from proven
+# in-window profit; the owner asked to focus on his two wallets only,
+# so auto-qualification is removed.)
 # ---------------------------------------------------------------------------
 
 SMART_MIN_CLOSES = 2
@@ -147,11 +149,27 @@ SMART_BONUS = 1.0                  # score bonus per proven holder
 SMART_BONUS_CAP = 2.0
 SMART_EXIT_FRACTION = 0.60         # proven holder sells >= 60%: mirror it
 
+# v7: the owner's watchlist. Per the owner's instruction the tracking
+# focuses on these two wallets only: both are pre-trusted as smart
+# degens from the first slot (they do not need to earn the label from
+# window data), and the auto-qualification of other wallets is off.
+# W1 is a sniper the owner follows (buys new tokens, sells on top);
+# W2 is a whale / smart degen. Entries backed by a watchlist holder
+# may ride to a 2x take-profit (WATCH_TP) instead of the usual one.
+WATCHLIST = {
+    "DkzUg73acuQzkctMNnBnVaSYeqDGXzWCtoiKV9GyZAJc": True,
+    "9NXNywh7n8d8ihgUY2FcJn9hEPwXkYCdLyBdbFiDm4rs": True,
+}
+WATCH_TP = 1.00                    # 2x take-profit for watchlist-backed entries
+watch_backed = {}                  # mint -> True when our entry had a
+                                   # watchlist holder behind it
+
 wallet_pos = {}       # (user, mint) -> [sol_in, tok_in, sol_out, tok_out,
                       #                  realized, last_buy_slot]
 wallet_book = {}      # user -> [realized_total, closes, wins]
 user_mints = {}       # user -> {mint: True} open positions, insertion ordered
-smart = set()         # users that earned the label (membership only)
+smart = set(WATCHLIST)  # v7: pre-trusted watchlist wallets (see below);
+                      # the label can no longer be earned by other wallets
 smart_in = {}         # mint -> {user: last_buy_slot} proven holders in now
 
 
@@ -185,15 +203,8 @@ def wallet_sell(user, mint, sol, tok, slot):
         si = smart_in.get(mint)
         if si is not None:
             si.pop(user, None)
-        if (user not in smart and book[1] >= SMART_MIN_CLOSES
-                and book[0] >= SMART_MIN_PROFIT
-                and book[2] * 5 >= book[1] * 3):
-            smart.add(user)
-            # Retro-mark this wallet's still-open positions.
-            for m2 in list(user_mints.get(user, {}).keys()):
-                wp2 = wallet_pos.get((user, m2))
-                if wp2 is not None:
-                    smart_in.setdefault(m2, {})[user] = wp2[5]
+        # v7: no auto-qualification — the smart set is the watchlist
+        # alone, fixed at start-up (see WATCHLIST below).
     return frac
 
 
@@ -433,7 +444,9 @@ def on_batch(state, batch):
             # weak endgame entries are cut faster.
             held[mint] = {"entry_slot": now, "peak_pnl": 0.0,
                           "sl": cur_tier[9], "tg": cur_tier[10],
-                          "soft": cur_tier[11]}
+                          "soft": cur_tier[11],
+                          "tp": WATCH_TP if mint in watch_backed
+                          else TAKE_PROFIT}
         elif mint in held and mint in closed_mints and mint not in state.positions:
             pass
 
@@ -466,7 +479,7 @@ def on_batch(state, batch):
         if pnl <= h.get("sl", -0.10):
             sell = True
             dead_mints.add(mint)
-        elif pnl >= TAKE_PROFIT:
+        elif pnl >= h.get("tp", TAKE_PROFIT):
             sell = True
         elif h["peak_pnl"] >= TRAIL_ARM and pnl <= h["peak_pnl"] - h.get("tg", 0.12):
             sell = True
@@ -542,6 +555,7 @@ def on_batch(state, batch):
             if st["low_after_high"] < VOL_MAX_CRASH:
                 continue  # already crashed hard once inside this window
             score = momentum_score(st)
+            backed = False
             si = smart_in.get(mint)
             if si:
                 recent = 0
@@ -549,10 +563,11 @@ def on_batch(state, batch):
                     if buy_slot >= now - EVAL_WINDOW and u in smart:
                         recent += 1
                 score += min(SMART_BONUS_CAP, recent * SMART_BONUS)
-            candidates.append((score, mint))
+                backed = recent > 0
+            candidates.append((score, mint, backed))
         # Highest score first; ties keep first-touch order (stable sort).
         candidates.sort(key=lambda c: -c[0])
-        for _, mint in candidates:
+        for _, mint, backed in candidates:
             if len(orders) >= max_orders or open_slots <= 0:
                 break
             cap = state.max_buy_lamports(mint)
@@ -567,6 +582,8 @@ def on_batch(state, batch):
                 "quote_lamports": amount,
                 "max_slippage_bps": MAX_SLIPPAGE_BPS,
             })
+            if backed:
+                watch_backed[mint] = True
             free -= amount + tx_fee
             open_slots -= 1
             pending_mints[mint] = True
